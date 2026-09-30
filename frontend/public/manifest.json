@@ -1,0 +1,13 @@
+{
+  "name": "Sombetini Primary School",
+  "short_name": "Sombetini",
+  "description": "Sombetini Primary School digital platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#FBF8F2",
+  "theme_color": "#1B4D3E",
+  "lang": "sw",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

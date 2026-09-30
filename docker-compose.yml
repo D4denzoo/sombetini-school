@@ -1,0 +1,162 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sombetini-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sombetini}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-sombetini_school}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-sombetini} -d ${POSTGRES_DB:-sombetini_school}']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sombetini-redis
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - redis_data:/data
+    # AOF keeps queued jobs and sessions across restarts; noeviction protects queue data from the LRU sweeper.
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sombetini-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # connection_limit × number of backend replicas must stay below Postgres max_connections (200).
+      DATABASE_URL: postgresql://${POSTGRES_USER:-sombetini}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-sombetini_school}?schema=public&connection_limit=${DB_POOL_SIZE:-10}&pool_timeout=20
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      LOG_FORMAT: json
+      PORT: 4000
+      TRUST_PROXY: '1'
+      UPLOAD_DIR: /app/uploads
+      PRIVATE_FILES_DIR: /app/storage/private
+      # Email links must use the nginx public origin, not :3000 (frontend is not published).
+      FRONTEND_URL: ${PUBLIC_API_URL:-http://localhost}
+      # Must include every origin families open (nginx public URL + optional local next :3000).
+      CORS_ORIGINS: ${PUBLIC_API_URL:-http://localhost},http://localhost:3000
+    env_file:
+      - .env
+    expose:
+      - '4000'
+    volumes:
+      - uploads_data:/app/uploads
+      - private_data:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/api/v1/health | grep -q '\"status\":\"ok\"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Browsers reach the API through Nginx on the public origin, not through port 4000.
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost}
+    container_name: sombetini-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost}
+      # Server-side fetches + the Next /api/v1 proxy must reach the API by Docker DNS, not localhost.
+      INTERNAL_API_URL: http://backend:4000
+      NODE_ENV: production
+    expose:
+      - '3000'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/ >/dev/null']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    container_name: sombetini-nginx
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      # Swap to ./docker/nginx/nginx.ssl.conf once certificates exist in ./docker/nginx/ssl (see that folder's README).
+      - ${NGINX_CONF:-./docker/nginx/nginx.conf}:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/proxy_params_sombetini:/etc/nginx/proxy_params_sombetini:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+      - certbot_www:/var/www/certbot:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1/nginx-health >/dev/null']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Nightly compressed pg_dump into the backups volume, pruned after BACKUP_RETENTION_DAYS.
+  # Sync that volume off this machine (rclone, S3, another server); a backup on the same disk is not a backup.
+  backup:
+    image: postgres:16-alpine
+    container_name: sombetini-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-sombetini}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-sombetini_school}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      BACKUP_HOUR_UTC: ${BACKUP_HOUR_UTC:-23}
+    volumes:
+      - backups_data:/backups
+      - ./docker/postgres/backup.sh:/usr/local/bin/backup.sh:ro
+    entrypoint: ['/bin/sh', '/usr/local/bin/backup.sh']
+
+  # Uncomment once a public domain points at this host; issues and renews Let's Encrypt certificates.
+  # certbot:
+  #   image: certbot/certbot
+  #   container_name: sombetini-certbot
+  #   volumes:
+  #     - ./docker/nginx/ssl:/etc/letsencrypt
+  #     - certbot_www:/var/www/certbot
+  #   entrypoint: /bin/sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done"
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  private_data:
+  backups_data:
+  certbot_www:
